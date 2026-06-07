@@ -6,10 +6,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: "Tag to release (example: v1.0.0)"
-        required: true
-        type: string
       release_name:
         description: "Release title (optional)"
         required: false
@@ -21,13 +17,35 @@ permissions:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
-      RELEASE_NAME: ${{ github.event_name == 'workflow_dispatch' && (inputs.release_name != '' && inputs.release_name || format('Release {0}', inputs.tag_name)) || format('Release {0}', github.ref_name) }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve release metadata from versionName
+        id: release_meta
+        shell: bash
+        run: |
+          VERSION_NAME=$(awk -F '"' '/versionName[[:space:]]*=/ { print $2; exit }' app/build.gradle.kts)
+          if [ -z "$VERSION_NAME" ]; then
+            echo "::error::Unable to read versionName from app/build.gradle.kts"
+            exit 1
+          fi
+
+          RELEASE_TAG="v$VERSION_NAME"
+          if [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_name }}" != "$RELEASE_TAG" ]; then
+            echo "::error::Pushed tag (${{ github.ref_name }}) does not match versionName-derived tag ($RELEASE_TAG)."
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.release_name }}" ]; then
+            RELEASE_NAME="${{ inputs.release_name }}"
+          else
+            RELEASE_NAME="Release $RELEASE_TAG"
+          fi
+
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -75,7 +93,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_NAME }}
+          tag_name: ${{ steps.release_meta.outputs.release_tag }}
+          name: ${{ steps.release_meta.outputs.release_name }}
           files: app/build/outputs/apk/release/app-release.apk
           generate_release_notes: true
