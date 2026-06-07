@@ -366,6 +366,7 @@ class BlePrinterManager(private val context: Context) {
                 }
             }
 
+            @Suppress("DEPRECATION")
             gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
             } else {

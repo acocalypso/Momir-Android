@@ -197,8 +197,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 .header("Accept", "image/*")
                 .build()
             http.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful || resp.body == null) return null
-                val bytes = resp.body!!.bytes()
+                if (!resp.isSuccessful) return null
+                val bytes = resp.body.bytes()
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             }
         } catch (_: Exception) {
