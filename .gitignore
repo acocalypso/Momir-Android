@@ -1,0 +1,28 @@
+# Android/Gradle
+.gradle/
+**/build/
+**/release/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+
+# Local machine configuration
+local.properties
+*.keystore
+*.jks
+
+# IDE
+.idea/
+*.iml
+
+# Kotlin
+.kotlin/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
