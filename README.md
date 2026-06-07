@@ -2,6 +2,13 @@
 
 Android app for the Momir printer flow.
 
+## Origin
+
+This project is an Android-native adaptation of the original Momir project:
+https://github.com/Devin-Cooper/momir-printer
+
+The primary focus for this Android version is the **Phomemo M02S** workflow.
+
 ## Features
 
 - First launch bootstrap:
@@ -48,6 +55,21 @@ Release build:
 
 - Android 12+: `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`
 - Android 11 and below: `ACCESS_FINE_LOCATION`
+
+## Printer Support
+
+Current BLE printer matching and profile selection are implemented in `BlePrinterManager`.
+
+| Printer model / name pattern | Status | Notes |
+| --- | --- | --- |
+| M02S | Supported (primary target) | Default profile in app; tuned chunking for stability. |
+| M02 PRO | Supported | Mapped to M02S profile settings. |
+| M02 | Supported | Uses M02 profile (384px width, conservative transfer mode). |
+| T02 | Supported | Mapped to M02 profile. |
+| M04 / M04S / M04AS | Supported | Matched by `M04*` naming and mapped to M04S-style profile. |
+| Mr.in_ naming | Detected (fallback profile) | Name is matched during scan; currently falls back to M02S profile. |
+
+If your printer advertises a different Bluetooth name, it may not be auto-detected until the name matcher is extended.
 
 ## Project Structure
 
