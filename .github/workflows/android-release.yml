@@ -39,16 +39,16 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Build release APK
+      - name: Build installable APK
         run: |
           chmod +x ./gradlew
-          ./gradlew :app:assembleRelease
+          ./gradlew :app:assembleDebug
 
-      - name: Upload release APK artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-release-apk
-          path: app/build/outputs/apk/release/*.apk
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
       - name: Create GitHub release
@@ -56,5 +56,5 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_NAME }}
-          files: app/build/outputs/apk/release/*.apk
+          files: app/build/outputs/apk/debug/app-debug.apk
           generate_release_notes: true
