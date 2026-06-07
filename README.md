@@ -26,7 +26,7 @@ The primary focus for this Android version is the **Phomemo M02S** workflow.
 ## Requirements
 
 - Android Studio (latest stable)
-- Android SDK 36
+- Android SDK 37
 - JDK 21
 - Android device with BLE support (recommended for printer testing)
 
@@ -50,6 +50,28 @@ Release build:
 ```powershell
 .\gradlew.bat :app:assembleRelease
 ```
+
+## Signed Release With GitHub Actions
+
+The `Android Build and Release` workflow can produce a signed `app-release.apk` and attach it to the GitHub Release.
+
+Add these repository secrets in GitHub:
+
+- `ANDROID_KEYSTORE_BASE64`
+- `ANDROID_KEYSTORE_PASSWORD`
+- `ANDROID_KEY_ALIAS`
+- `ANDROID_KEY_PASSWORD`
+
+PowerShell helper to generate `ANDROID_KEYSTORE_BASE64` from your keystore file:
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("C:\path\to\your\release.keystore"))
+```
+
+Then trigger the workflow:
+
+1. Push a tag like `v0.3.1`, or
+2. Run `Android Build and Release` manually from the Actions tab and provide `tag_name`.
 
 ## Permissions
 
