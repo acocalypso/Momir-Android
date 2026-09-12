@@ -6,13 +6,14 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothStatusCodes
-import android.bluetooth.le.ScanSettings
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
@@ -22,7 +23,9 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 
 class BlePrinterManager(private val context: Context) {
@@ -36,6 +39,9 @@ class BlePrinterManager(private val context: Context) {
         val chunkSize: Int,
         val chunksPerBurst: Int,
         val burstDelayMs: Long,
+        val renderWidth: Int = 576,
+        val rotateForPrint: Boolean = false,
+        val useCreditFlowControl: Boolean = false,
     ) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
@@ -47,6 +53,9 @@ class BlePrinterManager(private val context: Context) {
             if (chunkSize != other.chunkSize) return false
             if (chunksPerBurst != other.chunksPerBurst) return false
             if (burstDelayMs != other.burstDelayMs) return false
+            if (renderWidth != other.renderWidth) return false
+            if (rotateForPrint != other.rotateForPrint) return false
+            if (useCreditFlowControl != other.useCreditFlowControl) return false
             if (name != other.name) return false
             if (!initCommands.contentEquals(other.initCommands)) return false
             if (!finalizeCommands.contentEquals(other.finalizeCommands)) return false
@@ -59,6 +68,9 @@ class BlePrinterManager(private val context: Context) {
             result = 31 * result + chunkSize
             result = 31 * result + chunksPerBurst
             result = 31 * result + burstDelayMs.hashCode()
+            result = 31 * result + renderWidth
+            result = 31 * result + rotateForPrint.hashCode()
+            result = 31 * result + useCreditFlowControl.hashCode()
             result = 31 * result + name.hashCode()
             result = 31 * result + initCommands.contentHashCode()
             result = 31 * result + finalizeCommands.contentHashCode()
@@ -72,31 +84,95 @@ class BlePrinterManager(private val context: Context) {
         private const val CONNECT_RETRY_DELAY_MS = 650L
         private const val MAX_CONNECT_ATTEMPTS = 2
 
-        private val SERVICE_UUID: UUID = UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb")
-        private val WRITE_UUID: UUID = UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+        private val SERVICE_UUID: UUID =
+            UUID.fromString("0000ff00-0000-1000-8000-00805f9b34fb")
+        private val WRITE_UUID: UUID =
+            UUID.fromString("0000ff02-0000-1000-8000-00805f9b34fb")
+        private val FLOW_CONTROL_UUID: UUID =
+            UUID.fromString("0000ff03-0000-1000-8000-00805f9b34fb")
+        private val CCCD_UUID: UUID =
+            UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        private const val PRO_INITIAL_CREDIT_WINDOW = 4
+        private const val PRO_INITIAL_WINDOW_DELAY_MS = 5L
+        private const val PRO_CREDIT_DETECT_TIMEOUT_MS = 250L
+        private const val PRO_CREDIT_TIMEOUT_MS = 1_000L
+        private const val PRO_FALLBACK_CHUNK_DELAY_MS = 20L
+
         private val NAME_PREFIXES = listOf("M04", "M02", "T02", "Mr.in_")
-        private val NAME_CONTAINS = listOf("M04S", "M04AS", "M02S", "M02 PRO", "M02", "T02", "MR.IN_")
+        private val NAME_CONTAINS =
+            listOf("M04S", "M04AS", "M02S", "M02 PRO", "M02", "T02", "MR.IN_")
 
         val PROFILE_M02 = Profile(
             name = "M02",
             printWidth = 384,
-            initCommands = byteArrayOf(0x1b, 0x40, 0x1f, 0x11, 0x02, 0x04, 0x1b, 0x61, 0x01, 0x1f, 0x11, 0x24, 0x00),
-            finalizeCommands = byteArrayOf(0x1b, 0x64, 0x02, 0x1b, 0x64, 0x02, 0x1f, 0x11, 0x08, 0x1f, 0x11, 0x0e, 0x1f, 0x11, 0x07, 0x1f, 0x11, 0x09),
+            initCommands = byteArrayOf(
+                0x1b, 0x40,
+                0x1f, 0x11, 0x02, 0x04,
+                0x1b, 0x61, 0x01,
+                0x1f, 0x11, 0x24, 0x00,
+            ),
+            finalizeCommands = byteArrayOf(
+                0x1b, 0x64, 0x02,
+                0x1b, 0x64, 0x02,
+                0x1f, 0x11, 0x08,
+                0x1f, 0x11, 0x0e,
+                0x1f, 0x11, 0x07,
+                0x1f, 0x11, 0x09,
+            ),
             chunkSize = 512,
             chunksPerBurst = 1,
             burstDelayMs = 50,
+            renderWidth = 576,
         )
 
-        val PROFILE_M02S = PROFILE_M02.copy(name = "M02S", printWidth = 576, chunksPerBurst = 2)
+        val PROFILE_M02S = PROFILE_M02.copy(
+            name = "M02S",
+            printWidth = 576,
+            renderWidth = 576,
+            chunksPerBurst = 2,
+        )
+
+        // M02 Pro: physically measured community implementations indicate
+        // 624 printable dots (78 bytes/line) at 300 DPI. FF03 is used as
+        // optional vendor flow control on firmware that exposes it.
+        val PROFILE_M02_PRO = Profile(
+            name = "M02 PRO",
+            printWidth = 624,
+            renderWidth = 624,
+            initCommands = byteArrayOf(
+                0x1b, 0x40,
+                0x1f, 0x11, 0x02, 0x04,
+            ),
+            finalizeCommands = byteArrayOf(
+                0x1b, 0x64, 0x02,
+                0x1b, 0x64, 0x02,
+                0x1f, 0x11, 0x08,
+                0x1f, 0x11, 0x0e,
+                0x1f, 0x11, 0x07,
+                0x1f, 0x11, 0x09,
+            ),
+            chunkSize = 128,
+            chunksPerBurst = 1,
+            burstDelayMs = PRO_FALLBACK_CHUNK_DELAY_MS,
+            useCreditFlowControl = true,
+        )
 
         val PROFILE_M04S = Profile(
             name = "M04S",
             printWidth = 1232,
-            initCommands = byteArrayOf(0x1f, 0x11, 0x02, 0x04, 0x1f, 0x11, 0x37, 0x96.toByte(), 0x1f, 0x11, 0x0b, 0x1f, 0x11, 0x35, 0x00),
+            initCommands = byteArrayOf(
+                0x1f, 0x11, 0x02, 0x04,
+                0x1f, 0x11, 0x37, 0x96.toByte(),
+                0x1f, 0x11, 0x0b,
+                0x1f, 0x11, 0x35, 0x00,
+            ),
             finalizeCommands = byteArrayOf(0x1b, 0x64, 0x02),
             chunkSize = 205,
             chunksPerBurst = 3,
             burstDelayMs = 50,
+            renderWidth = 576,
+            rotateForPrint = true,
         )
     }
 
@@ -114,6 +190,11 @@ class BlePrinterManager(private val context: Context) {
     private var negotiatedMtu: Int = 23
     private var lastGattStatus: Int = 0
 
+    private val flowCredits = Channel<Unit>(Channel.UNLIMITED)
+
+    @Volatile
+    private var flowControlSubscribed = false
+
     var state: State = State.DISCONNECTED
         private set
 
@@ -128,15 +209,31 @@ class BlePrinterManager(private val context: Context) {
 
     fun hasBluetoothPermissions(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val scanGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-            val connectGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            val scanGranted =
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.BLUETOOTH_SCAN,
+                ) == PackageManager.PERMISSION_GRANTED
+            val connectGranted =
+                ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                ) == PackageManager.PERMISSION_GRANTED
             scanGranted && connectGranted
         } else {
-            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+            ) == PackageManager.PERMISSION_GRANTED
         }
     }
 
-    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
+    @RequiresPermission(
+        allOf = [
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        ],
+    )
     fun connect(onDone: (Boolean) -> Unit) {
         fun fail(msg: String) {
             Log.w(TAG, msg)
@@ -206,10 +303,19 @@ class BlePrinterManager(private val context: Context) {
                 }
             }
 
-            private fun processScanResult(result: ScanResult, callback: ScanCallback, done: (Boolean) -> Unit) {
+            private fun processScanResult(
+                result: ScanResult,
+                callback: ScanCallback,
+                done: (Boolean) -> Unit,
+            ) {
                 val d = result.device ?: return
                 val deviceName = try {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    if (
+                        ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
                         d.name
                     } else {
                         null
@@ -276,11 +382,18 @@ class BlePrinterManager(private val context: Context) {
     @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
     private fun connectGatt(device: BluetoothDevice, onDone: (Boolean) -> Unit) {
         Log.i(TAG, "Connecting GATT to ${device.address}")
-        deviceName = try { device.name } catch (e: SecurityException) { null }
+        deviceName = try {
+            device.name
+        } catch (_: SecurityException) {
+            null
+        }
         profile = detectProfile(deviceName.orEmpty())
         lastError = null
         negotiatedMtu = 23
         lastGattStatus = 0
+        flowControlSubscribed = false
+        drainFlowCredits()
+
         var connectResultDelivered = false
 
         safelyCloseGatt(gatt)
@@ -295,14 +408,24 @@ class BlePrinterManager(private val context: Context) {
 
         fun connectAttempt(attempt: Int) {
             Log.i(TAG, "Connecting GATT attempt $attempt/$MAX_CONNECT_ATTEMPTS to ${device.address}")
+
             val callback = object : BluetoothGattCallback() {
-                override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+                override fun onConnectionStateChange(
+                    g: BluetoothGatt,
+                    status: Int,
+                    newState: Int,
+                ) {
                     Log.d(TAG, "GATT state changed: status=$status newState=$newState")
                     lastGattStatus = status
+
                     if (newState == BluetoothGatt.STATE_CONNECTED) {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                        if (
+                            ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.BLUETOOTH_CONNECT,
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
                             try {
-                                // Improve link stability under sustained write load.
                                 g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                             } catch (_: SecurityException) {
                             }
@@ -316,20 +439,35 @@ class BlePrinterManager(private val context: Context) {
                             }
                         }
                     } else {
-                        if (!connectResultDelivered && status == 133 && attempt < MAX_CONNECT_ATTEMPTS) {
-                            Log.w(TAG, "GATT 133 on attempt $attempt/$MAX_CONNECT_ATTEMPTS, retrying...")
+                        flowControlSubscribed = false
+                        drainFlowCredits()
+
+                        if (
+                            !connectResultDelivered &&
+                            status == 133 &&
+                            attempt < MAX_CONNECT_ATTEMPTS
+                        ) {
+                            Log.w(
+                                TAG,
+                                "GATT 133 on attempt $attempt/$MAX_CONNECT_ATTEMPTS, retrying...",
+                            )
                             safelyCloseGatt(g)
                             if (g === gatt) {
                                 gatt = null
                             }
-                            mainHandler.postDelayed({ connectAttempt(attempt + 1) }, CONNECT_RETRY_DELAY_MS)
+                            mainHandler.postDelayed(
+                                { connectAttempt(attempt + 1) },
+                                CONNECT_RETRY_DELAY_MS,
+                            )
                             return
                         }
 
                         state = State.DISCONNECTED
                         writeChar = null
                         if (status != BluetoothGatt.GATT_SUCCESS) {
-                            lastError = "GATT disconnected (status=$status). Check printer battery/temperature and retry."
+                            lastError =
+                                "GATT disconnected (status=$status). " +
+                                    "Check printer battery/temperature and retry."
                         } else {
                             lastError = "GATT disconnected"
                         }
@@ -355,20 +493,93 @@ class BlePrinterManager(private val context: Context) {
                     val service: BluetoothGattService? = g.getService(SERVICE_UUID)
                     writeChar = service?.getCharacteristic(WRITE_UUID)
                     state = if (writeChar != null) State.READY else State.DISCONNECTED
+
                     if (writeChar == null) {
                         lastError = "Printer write characteristic not found"
                         Log.w(TAG, lastError ?: "Printer write characteristic not found")
                     } else {
                         lastError = null
-                        Log.i(TAG, "Printer is ready: profile=${profile.name} width=${profile.printWidth}")
+
+                        val writeProperties = writeChar?.properties ?: 0
+                        Log.i(
+                            TAG,
+                            "Write characteristic FF02 properties=0x${writeProperties.toString(16)}",
+                        )
+                        Log.i(
+                            TAG,
+                            "Printer is ready: profile=${profile.name} " +
+                                "width=${profile.printWidth} renderWidth=${profile.renderWidth}",
+                        )
+
+                        if (profile.useCreditFlowControl) {
+                            val flowChar = service?.getCharacteristic(FLOW_CONTROL_UUID)
+                            if (flowChar == null) {
+                                Log.w(
+                                    TAG,
+                                    "M02 Pro FF03 characteristic not found; using timed BLE pacing",
+                                )
+                            } else {
+                                val requested =
+                                    enableFlowControlNotifications(g, flowChar)
+                                Log.i(
+                                    TAG,
+                                    "M02 Pro FF03 notification setup requested=$requested",
+                                )
+                            }
+                        }
                     }
+
                     completeConnectOnce(writeChar != null)
+                }
+
+                override fun onDescriptorWrite(
+                    g: BluetoothGatt,
+                    descriptor: BluetoothGattDescriptor,
+                    status: Int,
+                ) {
+                    if (
+                        descriptor.uuid == CCCD_UUID &&
+                        descriptor.characteristic.uuid == FLOW_CONTROL_UUID
+                    ) {
+                        flowControlSubscribed = status == BluetoothGatt.GATT_SUCCESS
+                        if (flowControlSubscribed) {
+                            Log.i(TAG, "M02 Pro FF03 notifications enabled")
+                        } else {
+                            Log.w(
+                                TAG,
+                                "M02 Pro FF03 notification setup failed " +
+                                    "(status=$status); using timed pacing",
+                            )
+                        }
+                    }
+                }
+
+                @Suppress("DEPRECATION")
+                override fun onCharacteristicChanged(
+                    g: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                ) {
+                    val value = characteristic.value ?: return
+                    handleFlowControlNotification(characteristic.uuid, value)
+                }
+
+                override fun onCharacteristicChanged(
+                    g: BluetoothGatt,
+                    characteristic: BluetoothGattCharacteristic,
+                    value: ByteArray,
+                ) {
+                    handleFlowControlNotification(characteristic.uuid, value)
                 }
             }
 
             @Suppress("DEPRECATION")
             gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
+                device.connectGatt(
+                    context,
+                    false,
+                    callback,
+                    BluetoothDevice.TRANSPORT_LE,
+                )
             } else {
                 device.connectGatt(context, false, callback)
             }
@@ -384,60 +595,153 @@ class BlePrinterManager(private val context: Context) {
         if (state != State.READY) return false
 
         state = State.PRINTING
+
         try {
             val linkPayload = (negotiatedMtu - 3).coerceAtLeast(20)
-            val conservative = profile.name == "M02" || profile.name == "M02S"
-            val effectiveChunkSize = if (conservative) {
-                minOf(profile.chunkSize, linkPayload, 205)
-            } else {
-                minOf(profile.chunkSize, linkPayload)
-            }
-            val effectiveChunksPerBurst = if (conservative) 1 else profile.chunksPerBurst
-            val effectiveBurstDelayMs = if (conservative) maxOf(profile.burstDelayMs, 70L) else profile.burstDelayMs
+            val conservative =
+                profile.name == "M02" ||
+                    profile.name == "M02S"
+
+            val effectiveChunkSize =
+                if (conservative) {
+                    minOf(profile.chunkSize, linkPayload, 205)
+                } else {
+                    minOf(profile.chunkSize, linkPayload)
+                }
+
+            val effectiveChunksPerBurst =
+                if (conservative) 1 else profile.chunksPerBurst
+            val effectiveBurstDelayMs =
+                if (conservative) {
+                    maxOf(profile.burstDelayMs, 70L)
+                } else {
+                    profile.burstDelayMs
+                }
             val interChunkDelayMs = if (conservative) 12L else 8L
+
+            val creditCapable =
+                profile.useCreditFlowControl && flowControlSubscribed
+
+            if (profile.useCreditFlowControl) {
+                drainFlowCredits()
+            }
+
+            var creditModeConfirmed = false
+            var creditFallback =
+                profile.useCreditFlowControl && !creditCapable
 
             Log.i(
                 TAG,
-                "Sending ${commands.size} bytes in chunks of $effectiveChunkSize (mtu=$negotiatedMtu, burst=$effectiveChunksPerBurst)",
+                "Sending ${commands.size} bytes in chunks of $effectiveChunkSize " +
+                    "(mtu=$negotiatedMtu, burst=$effectiveChunksPerBurst, " +
+                    "creditFlow=$creditCapable)",
             )
-            val chunks = commands.asList().chunked(effectiveChunkSize).map { it.toByteArray() }
+
+            val chunks =
+                commands.asList()
+                    .chunked(effectiveChunkSize)
+                    .map { it.toByteArray() }
+
             for ((i, chunk) in chunks.withIndex()) {
                 if (state == State.DISCONNECTED) {
-                    lastError = lastError ?: "Disconnected during BLE transfer (status=$lastGattStatus)"
+                    lastError =
+                        lastError
+                            ?: "Disconnected during BLE transfer (status=$lastGattStatus)"
                     Log.w(TAG, lastError ?: "Disconnected during BLE transfer")
                     return false
                 }
 
-                val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    g.writeCharacteristic(ch, chunk, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                    // On older APIs, we must use setValue and writeCharacteristic(characteristic)
-                    // These are deprecated in newer APIs but there's no non-deprecated alternative for < 33
-                    @Suppress("DEPRECATION")
-                    ch.value = chunk
-                    @Suppress("DEPRECATION")
-                    val result = g.writeCharacteristic(ch)
-                    result
+                if (
+                    profile.useCreditFlowControl &&
+                    creditCapable &&
+                    !creditFallback &&
+                    i >= PRO_INITIAL_CREDIT_WINDOW
+                ) {
+                    val timeoutMs =
+                        if (creditModeConfirmed) {
+                            PRO_CREDIT_TIMEOUT_MS
+                        } else {
+                            PRO_CREDIT_DETECT_TIMEOUT_MS
+                        }
+
+                    val receivedCredit =
+                        withTimeoutOrNull(timeoutMs) {
+                            flowCredits.receive()
+                            true
+                        } ?: false
+
+                    if (receivedCredit) {
+                        if (!creditModeConfirmed) {
+                            Log.i(TAG, "M02 Pro FF03 credit flow confirmed")
+                        }
+                        creditModeConfirmed = true
+                    } else {
+                        creditFallback = true
+                        Log.w(
+                            TAG,
+                            "No M02 Pro FF03 credit received within ${timeoutMs}ms; " +
+                                "falling back to ${PRO_FALLBACK_CHUNK_DELAY_MS}ms pacing",
+                        )
+                    }
                 }
+
+                val ok =
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        g.writeCharacteristic(
+                            ch,
+                            chunk,
+                            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE,
+                        ) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        ch.writeType =
+                            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        @Suppress("DEPRECATION")
+                        ch.value = chunk
+                        @Suppress("DEPRECATION")
+                        g.writeCharacteristic(ch)
+                    }
+
                 if (!ok) {
-                    lastError = "BLE write failed at chunk ${i + 1}/${chunks.size} (status=$lastGattStatus)"
+                    lastError =
+                        "BLE write failed at chunk ${i + 1}/${chunks.size} " +
+                            "(status=$lastGattStatus)"
                     Log.w(TAG, lastError ?: "BLE write failed")
                     state = State.DISCONNECTED
                     return false
                 }
-                if ((i + 1) % effectiveChunksPerBurst == 0) {
-                    delay(effectiveBurstDelayMs)
+
+                if (profile.useCreditFlowControl) {
+                    when {
+                        creditFallback -> {
+                            delay(PRO_FALLBACK_CHUNK_DELAY_MS)
+                        }
+
+                        i < PRO_INITIAL_CREDIT_WINDOW - 1 -> {
+                            delay(PRO_INITIAL_WINDOW_DELAY_MS)
+                        }
+
+                        else -> {
+                            // In confirmed credit mode, the next iteration waits
+                            // for FF03 instead of sleeping here.
+                        }
+                    }
+                } else {
+                    if ((i + 1) % effectiveChunksPerBurst == 0) {
+                        delay(effectiveBurstDelayMs)
+                    }
+                    delay(interChunkDelayMs)
                 }
-                delay(interChunkDelayMs)
             }
+
             delay(2000)
             state = State.READY
             lastError = null
             return true
-        } catch (_: Exception) {
-            lastError = "BLE write threw exception"
-            Log.e(TAG, lastError ?: "BLE write exception")
+        } catch (e: Exception) {
+            lastError =
+                "BLE write threw ${e.javaClass.simpleName}" +
+                    (e.message?.let { ": $it" } ?: "")
+            Log.e(TAG, lastError ?: "BLE write exception", e)
             state = State.DISCONNECTED
             return false
         }
@@ -459,10 +763,92 @@ class BlePrinterManager(private val context: Context) {
             safelyCloseGatt(gatt)
         } catch (_: SecurityException) {
         }
+
         gatt = null
         writeChar = null
+        flowControlSubscribed = false
+        drainFlowCredits()
         negotiatedMtu = 23
         state = State.DISCONNECTED
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    private fun enableFlowControlNotifications(
+        g: BluetoothGatt,
+        characteristic: BluetoothGattCharacteristic,
+    ): Boolean {
+        if (
+            characteristic.properties and
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY == 0
+        ) {
+            Log.w(TAG, "FF03 exists but does not advertise NOTIFY")
+            return false
+        }
+
+        val localEnabled =
+            try {
+                g.setCharacteristicNotification(characteristic, true)
+            } catch (_: SecurityException) {
+                false
+            }
+
+        if (!localEnabled) {
+            Log.w(TAG, "Unable to enable local FF03 notifications")
+            return false
+        }
+
+        val descriptor =
+            characteristic.getDescriptor(CCCD_UUID)
+                ?: run {
+                    Log.w(TAG, "FF03 CCCD 0x2902 not found")
+                    return false
+                }
+
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                g.writeDescriptor(
+                    descriptor,
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE,
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                g.writeDescriptor(descriptor)
+            }
+        } catch (_: SecurityException) {
+            false
+        }
+    }
+
+    private fun handleFlowControlNotification(
+        uuid: UUID,
+        value: ByteArray,
+    ) {
+        if (uuid != FLOW_CONTROL_UUID) return
+
+        if (
+            value.size >= 2 &&
+            value[0] == 0x01.toByte() &&
+            value[1] == 0x01.toByte()
+        ) {
+            flowCredits.trySend(Unit)
+            return
+        }
+
+        Log.d(
+            TAG,
+            "Unexpected FF03 notification: " +
+                value.joinToString(" ") {
+                    "%02x".format(it.toInt() and 0xff)
+                },
+        )
+    }
+
+    private fun drainFlowCredits() {
+        while (flowCredits.tryReceive().isSuccess) {
+            // Drain queued credits from a previous print/job.
+        }
     }
 
     private fun safelyCloseGatt(gattRef: BluetoothGatt?) {
@@ -476,7 +862,8 @@ class BlePrinterManager(private val context: Context) {
 
     private fun matchesPrinterName(name: String): Boolean {
         val upper = name.uppercase()
-        return NAME_PREFIXES.any { upper.startsWith(it.uppercase()) } || NAME_CONTAINS.any { upper.contains(it) }
+        return NAME_PREFIXES.any { upper.startsWith(it.uppercase()) } ||
+            NAME_CONTAINS.any { upper.contains(it) }
     }
 
     private fun findBondedPrinter(adapter: BluetoothAdapter): BluetoothDevice? {
@@ -484,7 +871,12 @@ class BlePrinterManager(private val context: Context) {
             val devices = adapter.bondedDevices ?: emptySet()
             devices.firstOrNull { d ->
                 val n = try {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                    if (
+                        ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.BLUETOOTH_CONNECT,
+                        ) == PackageManager.PERMISSION_GRANTED
+                    ) {
                         d.name
                     } else {
                         null
@@ -501,7 +893,10 @@ class BlePrinterManager(private val context: Context) {
 
     private fun isLocationEnabled(): Boolean {
         return try {
-            val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return true
+            val lm =
+                context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+                    ?: return true
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 lm.isLocationEnabled
             } else {
@@ -518,7 +913,8 @@ class BlePrinterManager(private val context: Context) {
         val upper = name.uppercase()
         return when {
             upper.contains("M04") -> PROFILE_M04S
-            upper.contains("M02S") || upper.contains("M02 PRO") -> PROFILE_M02S
+            upper.contains("M02 PRO") -> PROFILE_M02_PRO
+            upper.contains("M02S") -> PROFILE_M02S
             upper.contains("M02") || upper.contains("T02") -> PROFILE_M02
             else -> PROFILE_M02S
         }
