@@ -9,6 +9,8 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Typeface
 import androidx.annotation.RequiresPermission
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.momir.android.ble.BlePrinterManager
@@ -21,11 +23,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import androidx.core.graphics.scale
-import androidx.core.graphics.createBitmap
 
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     enum class BootstrapMode {
@@ -69,9 +69,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         message = stageMessage(stage),
                     )
                 }
-                _ui.value = _ui.value.copy(loading = false, bootstrapping = false, message = "Ready", totalCreatures = total)
+                _ui.value = _ui.value.copy(
+                    loading = false,
+                    bootstrapping = false,
+                    message = "Ready",
+                    totalCreatures = total,
+                )
             } catch (e: Exception) {
-                _ui.value = _ui.value.copy(loading = false, bootstrapping = false, message = "Bootstrap failed: ${e.message}")
+                _ui.value = _ui.value.copy(
+                    loading = false,
+                    bootstrapping = false,
+                    message = "Bootstrap failed: ${e.message}",
+                )
             }
         }
     }
@@ -120,7 +129,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setShowPreviewImage(v: Boolean) {
         val current = _ui.value
-        _ui.value = current.copy(showPreviewImage = v, previewBitmap = if (v) current.previewBitmap else null)
+        _ui.value = current.copy(
+            showPreviewImage = v,
+            previewBitmap = if (v) current.previewBitmap else null,
+        )
         if (v && current.card != null && current.previewBitmap == null) {
             generatePreview(current.card)
         }
@@ -129,24 +141,46 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun roll() {
         val state = _ui.value
         val c = repo.getRandomCreature(state.selectedMv, state.includeFunny)
+
         if (c == null) {
-            _ui.value = state.copy(card = null, imageUrl = null, previewBitmap = null, message = "No creatures at MV ${state.selectedMv}")
+            _ui.value = state.copy(
+                card = null,
+                imageUrl = null,
+                previewBitmap = null,
+                message = "No creatures at MV ${state.selectedMv}",
+            )
             return
         }
+
         val image = buildScryfallImageUrl(c.name, "normal")
-        _ui.value = state.copy(card = c, imageUrl = image, previewBitmap = null, message = "Rolled ${c.name}")
+        _ui.value = state.copy(
+            card = c,
+            imageUrl = image,
+            previewBitmap = null,
+            message = "Rolled ${c.name}",
+        )
 
         if (state.showPreviewImage) {
             generatePreview(c)
         }
     }
 
-    @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT])
+    @RequiresPermission(
+        allOf = [
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+        ],
+    )
     fun connectPrinter() {
-        _ui.value = _ui.value.copy(message = "Scanning for printer...", printerState = BlePrinterManager.State.CONNECTING)
+        _ui.value = _ui.value.copy(
+            message = "Scanning for printer...",
+            printerState = BlePrinterManager.State.CONNECTING,
+        )
+
         ble.connect { ok ->
             val ps = ble.state
             val failure = ble.lastError ?: "Printer connect failed"
+
             _ui.value = _ui.value.copy(
                 printerState = ps,
                 printerName = ble.deviceName,
@@ -167,24 +201,68 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun printCurrentCard() {
         val state = _ui.value
         val card = state.card ?: return
+
         if (ble.state != BlePrinterManager.State.READY) {
             _ui.value = state.copy(message = "Printer not connected")
             return
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            _ui.value = _ui.value.copy(message = "Preparing print...", printerState = BlePrinterManager.State.PRINTING)
-            val rendered = state.previewBitmap ?: ThermalRenderer.renderCardBitmap(card, fetchArtCrop(card.name), printWidth = 576)
-            val toPrint = if (ble.profile.printWidth > 576) rotateAndCenter(rendered, ble.profile.printWidth) else resizeToWidth(rendered, ble.profile.printWidth)
+            _ui.value = _ui.value.copy(
+                message = "Preparing print...",
+                printerState = BlePrinterManager.State.PRINTING,
+            )
+
+            // Preview is normally 576 dots wide. Reuse it only for printer
+            // profiles whose source render width is also 576. M02 Pro is
+            // rendered natively at 624 dots so GS v 0 receives exactly
+            // 78 bytes per raster line.
+            val rendered =
+                if (
+                    state.previewBitmap != null &&
+                    ble.profile.renderWidth == 576
+                ) {
+                    state.previewBitmap
+                } else {
+                    ThermalRenderer.renderCardBitmap(
+                        card,
+                        fetchArtCrop(card.name),
+                        printWidth = ble.profile.renderWidth,
+                    )
+                }
+
+            // Rotation is a model property (M04-style), not a consequence of
+            // being wider than 576 pixels. This prevents the 624-dot M02 Pro
+            // from being rotated by the old "printWidth > 576" heuristic.
+            val toPrint =
+                if (ble.profile.rotateForPrint) {
+                    rotateAndCenter(
+                        rendered,
+                        ble.profile.printWidth,
+                    )
+                } else {
+                    resizeToWidth(
+                        rendered,
+                        ble.profile.printWidth,
+                    )
+                }
+
             val commands = ThermalRenderer.buildPrintCommands(
                 toPrint,
                 init = ble.profile.initCommands,
                 finalize = ble.profile.finalizeCommands,
             )
+
             val ok = ble.sendCommands(commands)
+
             _ui.value = _ui.value.copy(
                 printerState = ble.state,
-                message = if (ok) "Printed ${card.name}" else (ble.lastError ?: "Print failed"),
+                message =
+                    if (ok) {
+                        "Printed ${card.name}"
+                    } else {
+                        ble.lastError ?: "Print failed"
+                    },
             )
         }
     }
@@ -196,6 +274,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 .header("User-Agent", "momir-android/1.0")
                 .header("Accept", "image/*")
                 .build()
+
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return null
                 val bytes = resp.body.bytes()
@@ -204,13 +283,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         } catch (_: Exception) {
             null
         }
+
         return network ?: loadBundledDummyArt() ?: createGeneratedDummyArt(name)
     }
 
     private fun loadBundledDummyArt(): Bitmap? {
         val app = getApplication<Application>()
 
-        // Preferred: place file at app/src/main/assets/dummy.png
         try {
             app.assets.open("dummy.png").use { input ->
                 return BitmapFactory.decodeStream(input)
@@ -218,10 +297,17 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         } catch (_: Exception) {
         }
 
-        // Alternative: place file in res/drawable as "dummy"
         return try {
-            val resId = app.resources.getIdentifier("dummy", "drawable", app.packageName)
-            if (resId != 0) BitmapFactory.decodeResource(app.resources, resId) else null
+            val resId = app.resources.getIdentifier(
+                "dummy",
+                "drawable",
+                app.packageName,
+            )
+            if (resId != 0) {
+                BitmapFactory.decodeResource(app.resources, resId)
+            } else {
+                null
+            }
         } catch (_: Exception) {
             null
         }
@@ -230,7 +316,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun createGeneratedDummyArt(name: String): Bitmap {
         val width = 1024
         val height = 1024
-        val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val bmp = Bitmap.createBitmap(
+            width,
+            height,
+            Bitmap.Config.ARGB_8888,
+        )
         val canvas = Canvas(bmp)
 
         canvas.drawColor(Color.rgb(242, 244, 248))
@@ -240,7 +330,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             style = Paint.Style.STROKE
             strokeWidth = 10f
         }
-        canvas.drawRect(24f, 24f, (width - 24).toFloat(), (height - 24).toFloat(), border)
+        canvas.drawRect(
+            24f,
+            24f,
+            (width - 24).toFloat(),
+            (height - 24).toFloat(),
+            border,
+        )
 
         val title = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(45, 55, 72)
@@ -248,11 +344,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             typeface = Typeface.DEFAULT_BOLD
             textAlign = Paint.Align.CENTER
         }
+
         val subtitle = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(99, 115, 129)
             textSize = 36f
             textAlign = Paint.Align.CENTER
         }
+
         val mark = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.rgb(75, 85, 99)
             textSize = 260f
@@ -264,22 +362,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         canvas.drawText("offline fallback", width / 2f, 210f, subtitle)
         canvas.drawText("?", width / 2f, 590f, mark)
 
-        val maxName = if (name.length > 40) name.take(37) + "..." else name
-        canvas.drawText(maxName, width / 2f, 910f, subtitle)
+        val maxName =
+            if (name.length > 40) {
+                name.take(37) + "..."
+            } else {
+                name
+            }
 
+        canvas.drawText(maxName, width / 2f, 910f, subtitle)
         return bmp
     }
 
     private fun generatePreview(card: Creature) {
         viewModelScope.launch(Dispatchers.IO) {
             val art = fetchArtCrop(card.name)
-            val preview = ThermalRenderer.renderCardBitmap(card, art, printWidth = 576)
+            val preview =
+                ThermalRenderer.renderCardBitmap(
+                    card,
+                    art,
+                    printWidth = 576,
+                )
             _ui.value = _ui.value.copy(previewBitmap = preview)
         }
     }
 
     private fun buildScryfallImageUrl(name: String, version: String): String {
-        return "https://api.scryfall.com/cards/named".toHttpUrl().newBuilder()
+        return "https://api.scryfall.com/cards/named"
+            .toHttpUrl()
+            .newBuilder()
             .addQueryParameter("exact", name)
             .addQueryParameter("format", "image")
             .addQueryParameter("version", version)
@@ -289,30 +399,54 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun stageMessage(stage: AtomicBootstrapper.Stage): String {
         return when (stage) {
-            AtomicBootstrapper.Stage.DOWNLOADING -> "Downloading AtomicCards JSON..."
-            AtomicBootstrapper.Stage.PROCESSING -> "Processing creatures index..."
-            AtomicBootstrapper.Stage.LOADING -> "Loading local creature database..."
+            AtomicBootstrapper.Stage.DOWNLOADING ->
+                "Downloading AtomicCards JSON..."
+
+            AtomicBootstrapper.Stage.PROCESSING ->
+                "Processing creatures index..."
+
+            AtomicBootstrapper.Stage.LOADING ->
+                "Loading local creature database..."
         }
     }
 
     private fun resizeToWidth(bitmap: Bitmap, width: Int): Bitmap {
         if (bitmap.width == width) return bitmap
-        val h = (bitmap.height.toFloat() * (width.toFloat() / bitmap.width.toFloat())).toInt()
+
+        val h =
+            (
+                bitmap.height.toFloat() *
+                    (width.toFloat() / bitmap.width.toFloat())
+                ).toInt()
+
         return bitmap.scale(width, h.coerceAtLeast(1))
     }
 
-    private fun rotateAndCenter(bitmap: Bitmap, printWidth: Int): Bitmap {
-        val rotated = createBitmap(bitmap.height, bitmap.width)
-        val canvas = android.graphics.Canvas(rotated)
+    private fun rotateAndCenter(
+        bitmap: Bitmap,
+        printWidth: Int,
+    ): Bitmap {
+        val rotated = createBitmap(
+            bitmap.height,
+            bitmap.width,
+        )
+
+        val canvas = Canvas(rotated)
         canvas.rotate(90f)
         canvas.translate(0f, -bitmap.height.toFloat())
         canvas.drawBitmap(bitmap, 0f, 0f, null)
 
-        val out = createBitmap(printWidth, rotated.height)
-        val c = android.graphics.Canvas(out)
-        c.drawColor(android.graphics.Color.WHITE)
+        val out = createBitmap(
+            printWidth,
+            rotated.height,
+        )
+
+        val c = Canvas(out)
+        c.drawColor(Color.WHITE)
+
         val x = (printWidth - rotated.width) / 2f
         c.drawBitmap(rotated, x, 0f, null)
+
         return out
     }
 
